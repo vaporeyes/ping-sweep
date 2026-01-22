@@ -2,9 +2,13 @@
 # ABOUTME: Provides non-blocking host reachability checking.
 
 import asyncio
+import errno
+import logging
 import platform
 import re
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 async def ping_host(host: str, timeout: float = 1.0) -> Optional[float]:
@@ -41,7 +45,19 @@ async def ping_host(host: str, timeout: float = 1.0) -> Optional[float]:
         output = stdout.decode("utf-8", errors="ignore")
         return _parse_ping_rtt(output)
 
-    except (OSError, asyncio.CancelledError):
+    except OSError as e:
+        if e.errno == errno.EMFILE:
+            logger.warning(
+                "Too many open files (EMFILE). Consider reducing concurrency. "
+                "Host %s skipped.", host
+            )
+        elif e.errno == errno.ENFILE:
+            logger.warning(
+                "System file limit reached (ENFILE). Consider reducing concurrency. "
+                "Host %s skipped.", host
+            )
+        return None
+    except asyncio.CancelledError:
         return None
 
 

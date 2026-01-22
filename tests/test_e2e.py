@@ -1,8 +1,11 @@
 # ABOUTME: End-to-end tests for the ping sweep CLI.
 # ABOUTME: Tests the full application from command line invocation to output.
 
+import json
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -118,3 +121,121 @@ class TestCliAsModule:
             cwd="src",
         )
         assert result.returncode == 0
+
+
+class TestCliJsonOutput:
+    """End-to-end tests for JSON output."""
+
+    def test_json_flag_outputs_valid_json(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "ping_sweep.cli", "127.0.0.1", "--json", "-t", "2"],
+            capture_output=True,
+            text=True,
+            cwd="src",
+            timeout=10,
+        )
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert "results" in data
+        assert "summary" in data
+        assert len(data["results"]) == 1
+        assert data["results"][0]["ip"] == "127.0.0.1"
+        assert data["results"][0]["is_alive"] is True
+
+    def test_json_output_includes_summary(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "ping_sweep.cli", "192.0.2.1-3", "--json", "-t", "0.5"],
+            capture_output=True,
+            text=True,
+            cwd="src",
+            timeout=10,
+        )
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["summary"]["total"] == 3
+        assert data["summary"]["alive"] == 0
+        assert data["summary"]["dead"] == 3
+
+    def test_json_with_alive_only(self):
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ping_sweep.cli",
+                "127.0.0.1-3", "--json", "--alive-only", "-t", "1"
+            ],
+            capture_output=True,
+            text=True,
+            cwd="src",
+            timeout=15,
+        )
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        # Results should only contain alive hosts
+        for r in data["results"]:
+            assert r["is_alive"] is True
+
+
+class TestCliFileExport:
+    """End-to-end tests for file export."""
+
+    def test_output_to_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outfile = Path(tmpdir) / "results.json"
+            result = subprocess.run(
+                [
+                    sys.executable, "-m", "ping_sweep.cli",
+                    "127.0.0.1", "-t", "2", "-o", str(outfile)
+                ],
+                capture_output=True,
+                text=True,
+                cwd="src",
+                timeout=10,
+            )
+            assert result.returncode == 0
+            assert outfile.exists()
+
+            data = json.loads(outfile.read_text())
+            assert "results" in data
+            assert data["results"][0]["ip"] == "127.0.0.1"
+
+    def test_output_file_with_json_flag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outfile = Path(tmpdir) / "scan.json"
+            result = subprocess.run(
+                [
+                    sys.executable, "-m", "ping_sweep.cli",
+                    "192.0.2.1-2", "-t", "0.5", "--json", "-o", str(outfile)
+                ],
+                capture_output=True,
+                text=True,
+                cwd="src",
+                timeout=10,
+            )
+            assert result.returncode == 0
+            # Should still print JSON to stdout
+            stdout_data = json.loads(result.stdout)
+            assert "results" in stdout_data
+
+            # And also write to file
+            file_data = json.loads(outfile.read_text())
+            assert "results" in file_data
+
+    def test_output_without_json_flag_still_writes_json_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outfile = Path(tmpdir) / "output.json"
+            result = subprocess.run(
+                [
+                    sys.executable, "-m", "ping_sweep.cli",
+                    "127.0.0.1", "-t", "2", "-o", str(outfile)
+                ],
+                capture_output=True,
+                text=True,
+                cwd="src",
+                timeout=10,
+            )
+            assert result.returncode == 0
+            # Stdout should be human-readable (not JSON)
+            assert "alive" in result.stdout
+
+            # But file should be JSON
+            file_data = json.loads(outfile.read_text())
+            assert "results" in file_data
