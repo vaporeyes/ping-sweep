@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv init:*)",
+      "Bash(uv add:*)",
+      "Bash(git init:*)",
+      "Bash(git checkout:*)",
+      "Bash(uv run pytest:*)"
+    ]
+  }
+}
