@@ -2,9 +2,11 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::tcp::{MutableTcpPacket, TcpFlags, TcpPacket};
 use pnet::packet::Packet;
 use pnet::transport::{self, TransportChannelType, TransportProtocol};
+use pnet_datalink as datalink;
 
 use crate::results::ScanResult;
 
@@ -53,6 +55,19 @@ fn get_source_ip(target: Ipv4Addr) -> Option<Ipv4Addr> {
     }
 }
 
+/// Find the network interface that routes to the given target IP.
+fn find_interface_for_target(target: Ipv4Addr) -> Option<datalink::NetworkInterface> {
+    let source_ip = get_source_ip(target)?;
+    datalink::interfaces()
+        .into_iter()
+        .find(|iface| {
+            iface.ips.iter().any(|net| match net {
+                ipnetwork::IpNetwork::V4(v4net) => v4net.ip() == source_ip,
+                _ => false,
+            })
+        })
+}
+
 fn tcp_syn_scan_sync(ip: Ipv4Addr, port: u16, timeout: Duration) -> ScanResult {
     let ip_str = ip.to_string();
 
@@ -64,71 +79,97 @@ fn tcp_syn_scan_sync(ip: Ipv4Addr, port: u16, timeout: Duration) -> ScanResult {
     let src_port = 49152 + (rand::random::<u16>() % 16384);
     let seq_num = rand::random::<u32>();
 
-    // Build TCP SYN packet
-    let mut tcp_buf = [0u8; TCP_HEADER_SIZE];
-    {
-        let mut tcp_pkt = MutableTcpPacket::new(&mut tcp_buf).unwrap();
-        tcp_pkt.set_source(src_port);
-        tcp_pkt.set_destination(port);
-        tcp_pkt.set_sequence(seq_num);
-        tcp_pkt.set_acknowledgement(0);
-        tcp_pkt.set_data_offset(5);
-        tcp_pkt.set_flags(TcpFlags::SYN);
-        tcp_pkt.set_window(64240);
-        tcp_pkt.set_urgent_ptr(0);
-        tcp_pkt.set_checksum(0);
-
-        let cksum = tcp_checksum_manual(source_ip, ip, tcp_pkt.packet());
-        tcp_pkt.set_checksum(cksum);
-    }
-
-    // Open transport channel
-    let (mut tx, mut rx) = match transport::transport_channel(
-        4096,
+    // Open transport channel for SENDING the SYN packet
+    let (mut tx, _rx) = match transport::transport_channel(
+        65536,
         TransportChannelType::Layer4(TransportProtocol::Ipv4(IpNextHeaderProtocols::Tcp)),
     ) {
         Ok(pair) => pair,
         Err(_) => return ScanResult::dead_tcp(ip_str),
     };
 
-    let start = Instant::now();
+    // Open datalink channel for RECEIVING (BPF on macOS, bypasses kernel TCP stack)
+    let iface = match find_interface_for_target(ip) {
+        Some(i) => i,
+        None => return ScanResult::dead_tcp(ip_str),
+    };
 
-    // Send the SYN packet
-    let tcp_pkt_for_send = TcpPacket::new(&tcp_buf).unwrap();
+    let config = datalink::Config {
+        read_timeout: Some(timeout),
+        ..Default::default()
+    };
+
+    let (_dl_tx, mut dl_rx) = match datalink::channel(&iface, config) {
+        Ok(datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
+        _ => return ScanResult::dead_tcp(ip_str),
+    };
+
+    // Build the SYN packet
+    let mut tcp_buf = [0u8; TCP_HEADER_SIZE];
+    {
+        let mut tcp_pkt = MutableTcpPacket::new(&mut tcp_buf).unwrap();
+        tcp_pkt.set_source(src_port);
+        tcp_pkt.set_destination(port);
+        tcp_pkt.set_sequence(seq_num);
+        tcp_pkt.set_flags(TcpFlags::SYN);
+        tcp_pkt.set_window(64240);
+        tcp_pkt.set_data_offset(5);
+        tcp_pkt.set_checksum(tcp_checksum_manual(source_ip, ip, tcp_pkt.packet()));
+    }
+
+    let start = Instant::now();
     if tx
-        .send_to(tcp_pkt_for_send, std::net::IpAddr::V4(ip))
+        .send_to(TcpPacket::new(&tcp_buf).unwrap(), std::net::IpAddr::V4(ip))
         .is_err()
     {
         return ScanResult::dead_tcp(ip_str);
     }
 
-    // Listen for reply
-    let mut iter = transport::tcp_packet_iter(&mut rx);
-    loop {
-        let remaining = timeout.checked_sub(start.elapsed());
-        let remaining = match remaining {
-            Some(d) if d > Duration::ZERO => d,
-            _ => break,
-        };
+    // Listen on datalink layer -- parse Ethernet > IPv4 > TCP
+    while start.elapsed() < timeout {
+        match dl_rx.next() {
+            Ok(frame) => {
+                let eth = pnet::packet::ethernet::EthernetPacket::new(frame);
+                let eth = match eth {
+                    Some(e) => e,
+                    None => continue,
+                };
 
-        match iter.next_with_timeout(remaining) {
-            Ok(Some((reply_tcp, addr))) => {
-                if let std::net::IpAddr::V4(reply_ip) = addr {
-                    if reply_ip == ip
-                        && reply_tcp.get_destination() == src_port
-                        && reply_tcp.get_source() == port
-                    {
-                        let flags = reply_tcp.get_flags();
-                        if (flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0)
-                            || (flags & TcpFlags::RST != 0)
-                        {
-                            let rtt = start.elapsed().as_secs_f64() * 1000.0;
-                            return ScanResult::alive_tcp(ip_str, rtt, port);
-                        }
-                    }
+                if eth.get_ethertype() != pnet::packet::ethernet::EtherTypes::Ipv4 {
+                    continue;
+                }
+
+                let ipv4 = match Ipv4Packet::new(eth.payload()) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                if ipv4.get_source() != ip
+                    || ipv4.get_next_level_protocol() != IpNextHeaderProtocols::Tcp
+                {
+                    continue;
+                }
+
+                let tcp = match TcpPacket::new(ipv4.payload()) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                if tcp.get_destination() != src_port || tcp.get_source() != port {
+                    continue;
+                }
+
+                let flags = tcp.get_flags();
+                if (flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0)
+                    || (flags & TcpFlags::RST != 0)
+                {
+                    return ScanResult::alive_tcp(
+                        ip_str,
+                        start.elapsed().as_secs_f64() * 1000.0,
+                        port,
+                    );
                 }
             }
-            Ok(None) => break,
             Err(_) => break,
         }
     }
